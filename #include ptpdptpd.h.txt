@@ -1,0 +1,318 @@
+#include "ptpd/ptpd.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+// These are linked externally
+extern sys_mbox_t ptp_alert_queue;
+extern ptpd_opts opts;
+extern ptp_clock_t ptp_clock;
+
+void ptpd_alert(void) {
+    if (chMBPostI(ptp_alert_queue, (msg_t)((void*)NULL)) == MSG_TIMEOUT)
+        DBG("ptp: failed to post alert\n");
+}
+
+void ptpd_queue_init(ptp_buf_queue_t* queue) {
+    queue->head = queue->tail = 0;
+    sys_mutex_new(&queue->mutex);
+}
+
+bool ptpd_queue_put(ptp_buf_queue_t* queue, struct pbuf* p) {
+    sys_mutex_lock(&queue->mutex);
+    int next = (queue->head + 1) & PTPD_PBUF_QUEUE_MASK;
+    if (next == queue->tail) {
+        sys_mutex_unlock(&queue->mutex);
+        return false;
+    }
+    queue->head = next;
+    queue->pbuf[queue->head] = p;
+    sys_mutex_unlock(&queue->mutex);
+    return true;
+}
+
+void* ptpd_queue_get(ptp_buf_queue_t* queue) {
+    void* result = NULL;
+    sys_mutex_lock(&queue->mutex);
+    if (queue->tail != queue->head) {
+        queue->tail = (queue->tail + 1) & PTPD_PBUF_QUEUE_MASK;
+        result = queue->pbuf[queue->tail];
+    }
+    sys_mutex_unlock(&queue->mutex);
+    return result;
+}
+
+bool ptpd_is_queue_empty(ptp_buf_queue_t* queue) {
+    bool result;
+    sys_mutex_lock(&queue->mutex);
+    result = (queue->tail == queue->head);
+    sys_mutex_unlock(&queue->mutex);
+    return result;
+}
+
+void ptpd_empty_queue(ptp_buf_queue_t* queue) {
+    sys_mutex_lock(&queue->mutex);
+    while (queue->tail != queue->head) {
+        queue->tail = (queue->tail + 1) & PTPD_PBUF_QUEUE_MASK;
+        pbuf_free(queue->pbuf[queue->tail]);
+    }
+    sys_mutex_unlock(&queue->mutex);
+}
+
+void ptpd_empty_event_queue(net_path_t* net_path) {
+    ptpd_empty_queue(&net_path->event_q);
+}
+
+void ptpd_empty_general_queue(net_path_t* net_path) {
+    ptpd_empty_queue(&net_path->general_q);
+}
+
+ssize_t ptpd_recv_event(net_path_t* net_path, octet_t* buf, time_interval_t* time) {
+    return ptpd_net_recv(buf, time, &net_path->event_q);
+}
+
+ssize_t ptpd_recv_general(net_path_t* net_path, octet_t* buf, time_interval_t* time) {
+    return ptpd_net_recv(buf, time, &net_path->general_q);
+}
+
+ssize_t ptpd_send_event(net_path_t* net_path, const octet_t* buf, int16_t length, time_interval_t* time) {
+    return ptpd_net_send(buf, length, time, &net_path->addr_multicast, net_path->event_pcb);
+}
+
+ssize_t ptpd_send_general(net_path_t* net_path, const octet_t* buf, int16_t length) {
+    return ptpd_net_send(buf, length, NULL, &net_path->addr_multicast, net_path->general_pcb);
+}
+
+ssize_t ptpd_peer_send_general(net_path_t* net_path, const octet_t* buf, int16_t length) {
+    return ptpd_net_send(buf, length, NULL, &net_path->addr_peer_multicast, net_path->general_pcb);
+}
+
+ssize_t ptpd_peer_send_event(net_path_t* net_path, const octet_t* buf, int16_t length, time_interval_t* time) {
+    return ptpd_net_send(buf, length, time, &net_path->addr_peer_multicast, net_path->event_pcb);
+}
+
+void ptpd_update_time(const time_interval_t* time) {
+    sys_set_clocktime(time);
+}
+
+bool ptpd_adj_frequency(int32_t adj) {
+    DBG("ptpd_adj_frequency %ld\n", adj);
+    return false;
+}
+
+// Networking callbacks
+void ptpd_recv_event_callback(void* arg, struct udp_pcb* pcb, struct pbuf* p, const ip_addr_t* addr, u16_t port) {
+    (void) pcb; (void) addr; (void) port;
+    net_path_t* net_path = (net_path_t*)arg;
+    if (!ptpd_queue_put(&net_path->event_q, p)) {
+        pbuf_free(p);
+        ERROR("ptpd_recv_event_callback: queue full\n");
+        return;
+    }
+    ptpd_alert();
+}
+
+void ptpd_recv_general_callback(void* arg, struct udp_pcb* pcb, struct pbuf* p, const ip_addr_t* addr, u16_t port) {
+    (void) pcb; (void) addr; (void) port;
+    net_path_t* net_path = (net_path_t*)arg;
+    if (!ptpd_queue_put(&net_path->general_q, p)) {
+        pbuf_free(p);
+        ERROR("ptpd_recv_general_callback: queue full\n");
+        return;
+    }
+    ptpd_alert();
+}
+
+bool ptpd_net_init(net_path_t* net_path, ptp_clock_t* clock) {
+    struct in_addr addr_net;
+    ip_addr_t addr_interface;
+    err_t ret_bind;
+    char addr_str[NET_ADDRESS_LENGTH];
+
+    DBG("ptpd_net_init\n");
+
+    ptpd_queue_init(&net_path->event_q);
+    ptpd_queue_init(&net_path->general_q);
+
+    addr_interface.addr = ptpd_find_iface(clock->opts->iface_name, clock->port_uuid_field, net_path);
+    if (!(addr_interface.addr)) {
+        DBG("ptpd: ptpd_net_init: Failed to find interface address\n");
+        goto fail01;
+    }
+
+    net_path->event_pcb = udp_new();
+    if (NULL == net_path->event_pcb) {
+        DBG("ptpd: ptpd_net_init: Failed to open Event UDP PCB\n");
+        goto fail02;
+    }
+
+    net_path->general_pcb = udp_new();
+    if (NULL == net_path->general_pcb) {
+        ERROR("ptpd: ptpd_net_init: Failed to open General UDP PCB\n");
+        goto fail03;
+    }
+
+    net_path->addr_unicast = 0;
+
+    memcpy(addr_str, DEFAULT_PTP_DOMAIN_ADDRESS, NET_ADDRESS_LENGTH);
+    if (!inet_aton(addr_str, &addr_net)) {
+        DBG("ptpd: ptpd_net_init: failed to encode multi-cast address: %s\n", addr_str);
+        goto fail04;
+    }
+    net_path->addr_multicast = addr_net.s_addr;
+
+    DBG("join default group with %d\r\n", igmp_joingroup(&addr_interface, (ip_addr_t*)&addr_net));
+
+    memcpy(addr_str, PEER_PTP_DOMAIN_ADDRESS, NET_ADDRESS_LENGTH);
+    if (!inet_aton(addr_str, &addr_net)) {
+        DBG("ptpd: ptpd_net_init: failed to encode peer multi-cast address: %s\n", addr_str);
+        goto fail04;
+    }
+    net_path->addr_peer_multicast = addr_net.s_addr;
+
+    DBG("join peer group with %d\r\n", igmp_joingroup(&addr_interface, (ip_addr_t*)&addr_net));
+
+    udp_recv(net_path->event_pcb, ptpd_recv_event_callback, net_path);
+    ret_bind = udp_bind(net_path->event_pcb, IP_ADDR_ANY, PTP_EVENT_PORT);
+    if (ret_bind != ERR_OK)
+        DBG("failed to bind event port | %d\r\n", ret_bind);
+
+    udp_recv(net_path->general_pcb, ptpd_recv_general_callback, net_path);
+    ret_bind = udp_bind(net_path->general_pcb, IP_ADDR_ANY, PTP_GENERAL_PORT);
+    if (ret_bind != ERR_OK)
+        DBG("failed to bind general port | %d\r\n", ret_bind);
+
+    return true;
+
+fail04:
+    udp_remove(net_path->general_pcb);
+fail03:
+    udp_remove(net_path->event_pcb);
+fail02:
+fail01:
+    return false;
+}
+
+bool ptpd_shutdown(net_path_t* net_path) {
+    ip_addr_t addr_multicast;
+
+    DBG("ptpd_shutdown\n");
+
+    addr_multicast.addr = net_path->addr_multicast;
+    igmp_leavegroup(IP_ADDR_ANY, &addr_multicast);
+
+    if (net_path->event_pcb) {
+        udp_disconnect(net_path->event_pcb);
+        udp_remove(net_path->event_pcb);
+        net_path->event_pcb = NULL;
+    }
+
+    if (net_path->general_pcb) {
+        udp_disconnect(net_path->general_pcb);
+        udp_remove(net_path->general_pcb);
+        net_path->general_pcb = NULL;
+    }
+
+    net_path->addr_multicast = 0;
+    net_path->addr_unicast = 0;
+
+    return true;
+}
+
+int32_t ptpd_net_select(net_path_t* net_path, const time_interval_t* timeout) {
+    (void)timeout;
+    if (!ptpd_is_queue_empty(&net_path->event_q) || !ptpd_is_queue_empty(&net_path->general_q))
+        return 1;
+    return 0;
+}
+
+ssize_t ptpd_net_recv(octet_t* buf, time_interval_t* time, ptp_buf_queue_t* msg_queue) {
+    int i, j;
+    u16_t length;
+    struct pbuf* p;
+    struct pbuf* pcopy;
+
+    p = (struct pbuf*)ptpd_queue_get(msg_queue);
+    if (p == NULL) {
+        return 0;
+    }
+
+    if (p->tot_len > PACKET_SIZE) {
+        ERROR("ptpd_net_recv: received truncated message\n");
+        pbuf_free(p);
+        return 0;
+    }
+
+    if (p->tot_len == 0) {
+        ERROR("ptpd_net_recv: received empty packet\n");
+        pbuf_free(p);
+        return 0;
+    }
+
+    if (time != NULL) {
+#if LWIP_PTP
+        time->seconds = p->time_sec;
+        time->nanoseconds = p->time_nsec;
+#else
+        sys_get_clocktime(time);
+#endif
+    }
+
+    length = p->tot_len;
+
+    pcopy = p;
+    j = 0;
+    for (i = 0; i < length; i++) {
+        buf[i] = ((u8_t*)pcopy->payload)[j++];
+        if (j == pcopy->len) {
+            pcopy = pcopy->next;
+            j = 0;
+        }
+    }
+
+    pbuf_free(p);
+
+    return length;
+}
+
+ssize_t ptpd_net_send(const octet_t* buf, int16_t length, time_interval_t* time, const int32_t* addr, struct udp_pcb* pcb) {
+    err_t result;
+    struct pbuf* p;
+
+    p = pbuf_alloc(PBUF_TRANSPORT, length, PBUF_RAM);
+    if (p == NULL) {
+        ERROR("ptpd_net_send: Failed to allocate Tx Buffer\n");
+        goto fail01;
+    }
+
+    result = pbuf_take(p, buf, length);
+    if (result != ERR_OK) {
+        ERROR("ptpd_net_send: Failed to copy data to Pbuf (%d)\n", result);
+        goto fail02;
+    }
+
+    result = udp_sendto(pcb, p, (ip_addr_t*)addr, pcb->local_port);
+    if (result != ERR_OK) {
+        ERROR("ptpd_net_send: Failed to send data (%d)\n", result);
+        goto fail02;
+    }
+
+    if (time != NULL) {
+#if LWIP_PTP
+        time->seconds = p->time_sec;
+        time->nanoseconds = p->time_nsec;
+#else
+        sys_get_clocktime(time);
+#endif
+        DBGV("ptpd_net_send: %d sec %d nsec\n", time->seconds, time->nanoseconds);
+    } else {
+        DBGV("ptpd_net_send\n");
+    }
+
+fail02:
+    pbuf_free(p);
+
+fail01:
+    return length;
+}
+can 
