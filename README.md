@@ -44,7 +44,70 @@ This process ensures that your software has the correct, up-to-date information 
 
 
 
+#include "xparameters.h"
+#include "netif/xadapter.h"
+#include "platform.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
 
-Video
+// lwIP Includes
+#include "lwip/init.h"
+#include "lwip/netif.h"
+#include "lwip/inet.h"
+
+// --- Constant Definitions ---
+#define DEFAULT_IP_ADDRESS  "192.168.0.10"
+#define DEFAULT_IP_MASK     "255.255.255.0"
+#define DEFAULT_GW_ADDRESS  "192.168.0.1"
+
+// --- Global Variables ---
+struct netif server_netif;
+
+// --- Function Prototypes ---
+static void assign_default_ip(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw);
+
+int main()
+{
+    struct netif *netif = &server_netif;
+    unsigned char mac_ethernet_address[] = { 0x00, 0x0a, 0x35, 0x00, 0x01, 0x02 };
+
+    // 1. Initialize the platform (for UART)
+    init_platform();
+    xil_printf("--- Minimal lwIP Ping Test ---\r\n");
+
+    // 2. Initialize the lwIP stack
+    lwip_init();
+    xil_printf("lwIP Initialized.\r\n");
+
+    // 3. Add and configure the network interface
+    if (!xemac_add(netif, NULL, NULL, NULL, mac_ethernet_address, PLATFORM_EMAC_BASEADDR)) {
+        xil_printf("Error adding network interface\r\n");
+        return -1;
+    }
+    netif_set_default(netif);
+    netif_set_up(netif);
+    xil_printf("Network Interface is Up.\r\n");
+
+    // 4. Assign the static IP address
+    assign_default_ip(&(netif->ip_addr), &(netif->netmask), &(netif->gw));
+    xil_printf("IP Address Assigned: %s\r\n", ip4addr_ntoa(&(netif->ip_addr)));
+    xil_printf("Ready to be pinged.\r\n");
+
+    // 5. --- Main Polling Loop ---
+    // This loop does nothing but check for incoming network packets.
+    while (1) {
+        xemacif_input(netif);
+    }
+
+    cleanup_platform();
+    return 0;
+}
+
+// --- Helper function to assign the IP address ---
+static void assign_default_ip(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw) {
+    inet_aton(DEFAULT_IP_ADDRESS, ip);
+    inet_aton(DEFAULT_IP_MASK, mask);
+    inet_aton(DEFAULT_GW_ADDRESS, gw);
+}
 
 
